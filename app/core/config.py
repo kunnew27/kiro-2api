@@ -6,6 +6,7 @@ Centralized configuration management using Pydantic Settings.
 """
 
 import re
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -162,6 +163,20 @@ AVAILABLE_MODELS: List[str] = [
     "claude-sonnet-4-20250514",
     "claude-3-7-sonnet-20250219",
 ]
+
+
+_FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
+FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+FAKE_REASONING_MAX_TOKENS: int = int(os.getenv("FAKE_REASONING_MAX_TOKENS", "4000"))
+
+_FAKE_REASONING_HANDLING_RAW: str = os.getenv("FAKE_REASONING_HANDLING", "as_reasoning_content").lower()
+if _FAKE_REASONING_HANDLING_RAW in ("as_reasoning_content", "remove", "pass", "strip_tags"):
+    FAKE_REASONING_HANDLING: str = _FAKE_REASONING_HANDLING_RAW
+else:
+    FAKE_REASONING_HANDLING: str = "as_reasoning_content"
+
+FAKE_REASONING_OPEN_TAGS: List[str] = ["<thinking>", "<think>", "<reasoning>", "<thought>"]
+FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20"))
 
 
 # Version Info

@@ -19,9 +19,15 @@ import httpx
 from loguru import logger
 
 from app.libs.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from app.libs.thinking_parser import ThinkingParser
 from app.libs.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 from app.utils.helpers import generate_completion_id
-from app.core.config import settings, get_adaptive_timeout
+from app.core.config import (
+    settings,
+    get_adaptive_timeout,
+    FAKE_REASONING_ENABLED,
+    FAKE_REASONING_HANDLING,
+)
 
 if TYPE_CHECKING:
     from app.libs.auth import KiroAuthManager
@@ -51,6 +57,7 @@ async def _read_chunk_with_timeout(byte_iterator, timeout: float) -> bytes:
 
 def _calculate_usage_tokens(
     full_content: str,
+    full_reasoning_content: str,
     context_usage_percentage: Optional[float],
     model_cache: "ModelInfoCache",
     model: str,
@@ -58,7 +65,7 @@ def _calculate_usage_tokens(
     request_tools: Optional[list]
 ) -> Dict[str, Any]:
     """Calculate token usage from response."""
-    completion_tokens = count_tokens(full_content)
+    completion_tokens = count_tokens(full_content + (full_reasoning_content or ""))
 
     total_tokens_from_api = 0
     if context_usage_percentage is not None and context_usage_percentage > 0:
@@ -185,6 +192,11 @@ async def stream_kiro_to_openai(
     metering_data = None
     context_usage_percentage = None
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+
+    thinking_parser: Optional[ThinkingParser] = None
+    if FAKE_REASONING_ENABLED:
+        thinking_parser = ThinkingParser(handling_mode=FAKE_REASONING_HANDLING)
 
     adaptive_first_token_timeout = get_adaptive_timeout(model, settings.first_token_timeout)
     adaptive_stream_read_timeout = get_adaptive_timeout(model, settings.stream_read_timeout)
@@ -209,22 +221,71 @@ async def stream_kiro_to_openai(
         for event in events:
             if event["type"] == "content":
                 content = event["data"]
-                content_parts.append(content)
+                if thinking_parser:
+                    parse_result = thinking_parser.feed(content)
 
-                delta = {"content": content}
-                if first_chunk:
-                    delta["role"] = "assistant"
-                    first_chunk = False
+                    if parse_result.thinking_content:
+                        processed_thinking = thinking_parser.process_for_output(
+                            parse_result.thinking_content,
+                            parse_result.is_first_thinking_chunk,
+                            parse_result.is_last_thinking_chunk,
+                        )
+                        if processed_thinking:
+                            if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                                reasoning_parts.append(processed_thinking)
+                                delta = {"reasoning_content": processed_thinking}
+                            else:
+                                content_parts.append(processed_thinking)
+                                delta = {"content": processed_thinking}
 
-                openai_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
-                }
+                            if first_chunk:
+                                delta["role"] = "assistant"
+                                first_chunk = False
 
-                yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+                            openai_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                            }
+
+                            yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+
+                    if parse_result.regular_content:
+                        content_parts.append(parse_result.regular_content)
+
+                        delta = {"content": parse_result.regular_content}
+                        if first_chunk:
+                            delta["role"] = "assistant"
+                            first_chunk = False
+
+                        openai_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                        }
+
+                        yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+                else:
+                    content_parts.append(content)
+
+                    delta = {"content": content}
+                    if first_chunk:
+                        delta["role"] = "assistant"
+                        first_chunk = False
+
+                    openai_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                    }
+
+                    yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
 
             elif event["type"] == "usage":
                 metering_data = event["data"]
@@ -258,9 +319,95 @@ async def stream_kiro_to_openai(
             for event in events:
                 if event["type"] == "content":
                     content = event["data"]
-                    content_parts.append(content)
+                    if thinking_parser:
+                        parse_result = thinking_parser.feed(content)
 
-                    delta = {"content": content}
+                        if parse_result.thinking_content:
+                            processed_thinking = thinking_parser.process_for_output(
+                                parse_result.thinking_content,
+                                parse_result.is_first_thinking_chunk,
+                                parse_result.is_last_thinking_chunk,
+                            )
+                            if processed_thinking:
+                                if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                                    reasoning_parts.append(processed_thinking)
+                                    delta = {"reasoning_content": processed_thinking}
+                                else:
+                                    content_parts.append(processed_thinking)
+                                    delta = {"content": processed_thinking}
+
+                                if first_chunk:
+                                    delta["role"] = "assistant"
+                                    first_chunk = False
+
+                                openai_chunk = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_time,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                                }
+
+                                yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+
+                        if parse_result.regular_content:
+                            content_parts.append(parse_result.regular_content)
+
+                            delta = {"content": parse_result.regular_content}
+                            if first_chunk:
+                                delta["role"] = "assistant"
+                                first_chunk = False
+
+                            openai_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                            }
+
+                            yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+                    else:
+                        content_parts.append(content)
+
+                        delta = {"content": content}
+                        if first_chunk:
+                            delta["role"] = "assistant"
+                            first_chunk = False
+
+                        openai_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                        }
+
+                        yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+
+                elif event["type"] == "usage":
+                    metering_data = event["data"]
+
+                elif event["type"] == "context_usage":
+                    context_usage_percentage = event["data"]
+
+        if thinking_parser:
+            final_result = thinking_parser.finalize()
+
+            if final_result.thinking_content:
+                processed_thinking = thinking_parser.process_for_output(
+                    final_result.thinking_content,
+                    final_result.is_first_thinking_chunk,
+                    final_result.is_last_thinking_chunk,
+                )
+                if processed_thinking:
+                    if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                        reasoning_parts.append(processed_thinking)
+                        delta = {"reasoning_content": processed_thinking}
+                    else:
+                        content_parts.append(processed_thinking)
+                        delta = {"content": processed_thinking}
+
                     if first_chunk:
                         delta["role"] = "assistant"
                         first_chunk = False
@@ -275,13 +422,26 @@ async def stream_kiro_to_openai(
 
                     yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
 
-                elif event["type"] == "usage":
-                    metering_data = event["data"]
+            if final_result.regular_content:
+                content_parts.append(final_result.regular_content)
 
-                elif event["type"] == "context_usage":
-                    context_usage_percentage = event["data"]
+                delta = {"content": final_result.regular_content}
+                if first_chunk:
+                    delta["role"] = "assistant"
+                    first_chunk = False
+
+                openai_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                }
+
+                yield f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
 
         full_content = ''.join(content_parts)
+        full_reasoning_content = ''.join(reasoning_parts)
 
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = parser.get_tool_calls() + bracket_tool_calls
@@ -290,7 +450,7 @@ async def stream_kiro_to_openai(
         finish_reason = "tool_calls" if all_tool_calls else "stop"
 
         usage_info = _calculate_usage_tokens(
-            full_content, context_usage_percentage, model_cache, model,
+            full_content, full_reasoning_content, context_usage_percentage, model_cache, model,
             request_messages, request_tools
         )
 
@@ -379,6 +539,11 @@ async def collect_stream_response(
     metering_data = None
     context_usage_percentage = None
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+
+    thinking_parser: Optional[ThinkingParser] = None
+    if FAKE_REASONING_ENABLED:
+        thinking_parser = ThinkingParser(handling_mode=FAKE_REASONING_HANDLING)
 
     adaptive_stream_read_timeout = get_adaptive_timeout(model, settings.stream_read_timeout)
 
@@ -388,7 +553,25 @@ async def collect_stream_response(
 
             for event in events:
                 if event["type"] == "content":
-                    content_parts.append(event["data"])
+                    content = event["data"]
+                    if thinking_parser:
+                        parse_result = thinking_parser.feed(content)
+                        if parse_result.thinking_content:
+                            processed_thinking = thinking_parser.process_for_output(
+                                parse_result.thinking_content,
+                                parse_result.is_first_thinking_chunk,
+                                parse_result.is_last_thinking_chunk,
+                            )
+                            if processed_thinking:
+                                if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                                    reasoning_parts.append(processed_thinking)
+                                else:
+                                    content_parts.append(processed_thinking)
+
+                        if parse_result.regular_content:
+                            content_parts.append(parse_result.regular_content)
+                    else:
+                        content_parts.append(content)
                 elif event["type"] == "usage":
                     metering_data = event["data"]
                 elif event["type"] == "context_usage":
@@ -397,7 +580,25 @@ async def collect_stream_response(
     finally:
         await response.aclose()
 
+    if thinking_parser:
+        final_result = thinking_parser.finalize()
+        if final_result.thinking_content:
+            processed_thinking = thinking_parser.process_for_output(
+                final_result.thinking_content,
+                final_result.is_first_thinking_chunk,
+                final_result.is_last_thinking_chunk,
+            )
+            if processed_thinking:
+                if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                    reasoning_parts.append(processed_thinking)
+                else:
+                    content_parts.append(processed_thinking)
+
+        if final_result.regular_content:
+            content_parts.append(final_result.regular_content)
+
     full_content = ''.join(content_parts)
+    full_reasoning_content = ''.join(reasoning_parts)
 
     bracket_tool_calls = parse_bracket_tool_calls(full_content)
     all_tool_calls = parser.get_tool_calls() + bracket_tool_calls
@@ -406,7 +607,7 @@ async def collect_stream_response(
     finish_reason = "tool_calls" if all_tool_calls else "stop"
 
     usage_info = _calculate_usage_tokens(
-        full_content, context_usage_percentage, model_cache, model,
+        full_content, full_reasoning_content, context_usage_percentage, model_cache, model,
         request_messages, request_tools
     )
 
@@ -414,6 +615,9 @@ async def collect_stream_response(
         "role": "assistant",
         "content": full_content if not all_tool_calls else None,
     }
+
+    if full_reasoning_content:
+        message["reasoning_content"] = full_reasoning_content
 
     if all_tool_calls:
         message["tool_calls"] = _format_tool_calls_for_non_streaming(all_tool_calls)
