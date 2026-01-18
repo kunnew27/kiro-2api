@@ -155,6 +155,8 @@ class KiroHttpClient:
                 request_timeout = httpx.Timeout(timeout)
 
                 if stream:
+                    # Prevent CLOSE_WAIT connection leak (issue #38)
+                    headers["Connection"] = "close"
                     req = client.build_request(
                         method, url, json=json_data, headers=headers, timeout=request_timeout
                     )
