@@ -332,33 +332,146 @@ class AwsEventStreamParser:
                 try:
                     parsed = json.loads(args)
                     self.current_tool_call['function']['arguments'] = json.dumps(parsed)
-                    logger.debug(f"Tool '{tool_name}' arguments parsed successfully")
+                    logger.debug(f"Tool '{tool_name}' arguments parsed successfully: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
                 except json.JSONDecodeError as e:
-                    fixed_args = args.strip()
-                    open_braces = fixed_args.count('{')
-                    close_braces = fixed_args.count('}')
-                    if open_braces > close_braces:
-                        fixed_args += '}' * (open_braces - close_braces)
-                        logger.info(f"Auto-completing JSON for '{tool_name}': added {open_braces - close_braces} closing brace(s)")
-                        try:
-                            parsed = json.loads(fixed_args)
-                            self.current_tool_call['function']['arguments'] = json.dumps(parsed)
-                            logger.info(f"Successfully auto-completed JSON for '{tool_name}'")
-                        except json.JSONDecodeError:
-                            logger.warning(f"Auto-complete failed for '{tool_name}'")
+                    # Analyze the failure to provide better diagnostics
+                    truncation_info = self._diagnose_json_truncation(args)
+                    
+                    if truncation_info["is_truncated"]:
+                        # Log detailed truncation info
+                        logger.warning(
+                            f"Tool '{tool_name}' arguments appear truncated "
+                            f"({truncation_info['size_bytes']} bytes received, {truncation_info['reason']}). "
+                            f"This is NOT a Kiro-2API bug — the stream was cut off before complete data arrived. "
+                            f"Large tool call arguments (like writing big files) may trigger this limitation in Kiro API. "
+                            f"Preview: {args[:100]}..."
+                        )
+                        
+                        # Try to auto-complete truncated JSON
+                        fixed_args = args.strip()
+                        open_braces = fixed_args.count('{')
+                        close_braces = fixed_args.count('}')
+                        open_brackets = fixed_args.count('[')
+                        close_brackets = fixed_args.count(']')
+                        
+                        # Add missing closing brackets first, then braces
+                        if open_brackets > close_brackets:
+                            fixed_args += ']' * (open_brackets - close_brackets)
+                        if open_braces > close_braces:
+                            fixed_args += '}' * (open_braces - close_braces)
+                        
+                        if fixed_args != args.strip():
+                            logger.info(f"Attempting auto-complete for truncated '{tool_name}'")
+                            try:
+                                parsed = json.loads(fixed_args)
+                                self.current_tool_call['function']['arguments'] = json.dumps(parsed)
+                                logger.info(f"Successfully auto-completed truncated JSON for '{tool_name}'")
+                            except json.JSONDecodeError:
+                                logger.warning(f"Auto-complete failed for truncated '{tool_name}'")
+                                self.current_tool_call['function']['arguments'] = "{}"
+                        else:
                             self.current_tool_call['function']['arguments'] = "{}"
                     else:
-                        logger.warning(f"Failed to parse tool '{tool_name}' arguments: {e}")
+                        # Regular JSON parse error (malformed, not truncated)
+                        logger.warning(f"Failed to parse tool '{tool_name}' arguments: {e}. Raw: {args[:200]}")
                         self.current_tool_call['function']['arguments'] = "{}"
             else:
+                # Empty string - use empty object
+                logger.debug(f"Tool '{tool_name}' has empty arguments string (will be deduplicated)")
                 self.current_tool_call['function']['arguments'] = "{}"
         elif isinstance(args, dict):
             self.current_tool_call['function']['arguments'] = json.dumps(args)
+            logger.debug(f"Tool '{tool_name}' arguments already dict with keys: {list(args.keys())}")
         else:
+            logger.warning(f"Tool '{tool_name}' has unexpected arguments type: {type(args)}")
             self.current_tool_call['function']['arguments'] = "{}"
 
         self.tool_calls.append(self.current_tool_call)
         self.current_tool_call = None
+
+    def _diagnose_json_truncation(self, json_str: str) -> Dict[str, Any]:
+        """
+        Analyzes a malformed JSON string to determine if it was truncated.
+        
+        This helps distinguish between upstream issues (Kiro API cutting off
+        large tool call arguments) and actual malformed JSON from the model.
+        
+        Args:
+            json_str: The raw JSON string that failed to parse
+        
+        Returns:
+            Dictionary with diagnostic information:
+            - is_truncated: True if the JSON appears to be cut off
+            - reason: Human-readable explanation of why it's truncated
+            - size_bytes: Size of the received data
+        """
+        size_bytes = len(json_str.encode('utf-8'))
+        stripped = json_str.strip()
+        
+        # Check for obvious truncation signs
+        if not stripped:
+            return {"is_truncated": False, "reason": "empty string", "size_bytes": size_bytes}
+        
+        # Count braces and brackets (simplified, doesn't account for strings perfectly)
+        open_braces = stripped.count('{')
+        close_braces = stripped.count('}')
+        open_brackets = stripped.count('[')
+        close_brackets = stripped.count(']')
+        
+        # Check if JSON starts with { but doesn't end with }
+        if stripped.startswith('{') and not stripped.endswith('}'):
+            missing = open_braces - close_braces
+            return {
+                "is_truncated": True,
+                "reason": f"missing {missing} closing brace(s)",
+                "size_bytes": size_bytes
+            }
+        
+        # Check if JSON starts with [ but doesn't end with ]
+        if stripped.startswith('[') and not stripped.endswith(']'):
+            missing = open_brackets - close_brackets
+            return {
+                "is_truncated": True,
+                "reason": f"missing {missing} closing bracket(s)",
+                "size_bytes": size_bytes
+            }
+        
+        # Check for unbalanced braces/brackets
+        if open_braces != close_braces:
+            return {
+                "is_truncated": True,
+                "reason": f"unbalanced braces ({open_braces} open, {close_braces} close)",
+                "size_bytes": size_bytes
+            }
+        
+        if open_brackets != close_brackets:
+            return {
+                "is_truncated": True,
+                "reason": f"unbalanced brackets ({open_brackets} open, {close_brackets} close)",
+                "size_bytes": size_bytes
+            }
+        
+        # Check for unclosed string (ends with backslash or inside quotes)
+        # This is a heuristic - count unescaped quotes
+        quote_count = 0
+        i = 0
+        while i < len(stripped):
+            if stripped[i] == '\\' and i + 1 < len(stripped):
+                i += 2  # Skip escaped character
+                continue
+            if stripped[i] == '"':
+                quote_count += 1
+            i += 1
+        
+        if quote_count % 2 != 0:
+            return {
+                "is_truncated": True,
+                "reason": "unclosed string literal",
+                "size_bytes": size_bytes
+            }
+        
+        # Doesn't look truncated, probably just malformed
+        return {"is_truncated": False, "reason": "malformed JSON", "size_bytes": size_bytes}
 
     def get_tool_calls(self) -> List[Dict[str, Any]]:
         """Return collected tool calls, finalizing any pending one."""
