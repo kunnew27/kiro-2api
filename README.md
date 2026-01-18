@@ -2,7 +2,7 @@
 
 OpenAI compatible API gateway for Kiro (AWS CodeWhisperer AI).
 
-Based on the KiroGate project, restructured following FastAPI best practices.
+Based on the kiro-gateway project, restructured following FastAPI best practices.
 
 ## Features
 
@@ -180,6 +180,22 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 - Swagger UI: http://127.0.0.1:8000/docs
 - ReDoc: http://127.0.0.1:8000/redoc
 
+## Acknowledgments
+
+This project is a Python port/rewrite of [**Kiro Gateway**](https://github.com/jwadow/kiro-gateway) by [Jwadow](https://github.com/jwadow).
+
+Major components ported from kiro-gateway:
+- AWS Event Stream parser and tool call handling
+- OpenAI API compatibility layer
+- Streaming response conversion
+- Fake reasoning/thinking feature (`reasoning_content` support)
+- Authentication and token refresh logic
+- Connection management and retry logic
+
+Special thanks to **Jwadow** for the original implementation and making it open source!
+
 ## License
 
-Based on KiroGate by Jwadow - AGPL-3.0 License
+AGPL-3.0 License
+
+Based on [Kiro Gateway](https://github.com/jwadow/kiro-gateway) by [Jwadow](https://github.com/jwadow)
